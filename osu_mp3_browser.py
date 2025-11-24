@@ -6,6 +6,7 @@ import pygame
 import sys
 import re
 import time
+import json
 
 # try to import Pillow for image thumbnails
 try:
@@ -23,6 +24,11 @@ try:
 except Exception:
     MutagenFile = None
     HAS_MUTAGEN = False
+
+# Supported audio extensions
+SUPPORTED_AUDIO_EXTS = ('.mp3', '.ogg')
+MIN_DURATION_SECONDS = 30
+CACHE_FILENAME = '.osu_mp3_browser_cache.json'
 
 
 def get_default_osu_songs_dir():
@@ -59,11 +65,36 @@ class OsuMP3Browser(tk.Tk):
             pygame.mixer.init()
         except Exception as e:
             messagebox.showwarning("Audio init failed", f"pygame.mixer.init() failed: {e}")
+        # default volume (0.0 - 1.0)
+        self.volume_var = tk.DoubleVar(value=0.8)
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.music.set_volume(self.volume_var.get())
+        except Exception:
+            pass
+
+        # minimum duration (seconds) configurable via UI
+        self.min_duration_var = tk.IntVar(value=MIN_DURATION_SECONDS)
+        # dark mode toggle
+        self.dark_mode_var = tk.BooleanVar(value=False)
 
         self.songs_dir = get_default_osu_songs_dir()
+        # diagnostic: print songs_dir info
+        try:
+            print(f"Osu songs dir: {self.songs_dir} (exists={self.songs_dir.exists()})")
+            if self.songs_dir.exists():
+                try:
+                    children = list(self.songs_dir.iterdir())[:10]
+                    print(f"Top entries in songs dir: {[p.name for p in children]}")
+                except Exception as _:
+                    pass
+        except Exception:
+            pass
         # store tuples of (Path, folder_title) where folder_title is the parent folder name
         self.all_mp3_paths = []
         self.mp3_paths = []  # list of (Path, display_title)
+        # quick membership set of known paths to avoid duplicates during incremental scans
+        self._seen_paths = set()
 
         # UI
         top = ttk.Frame(self)
@@ -74,6 +105,19 @@ class OsuMP3Browser(tk.Tk):
 
         browse_btn = ttk.Button(top, text="Browse...", command=self.browse_folder)
         browse_btn.pack(side=tk.RIGHT)
+        # Manual scan button for debugging/refresh
+        scan_btn = ttk.Button(top, text="Scan Now", command=lambda: threading.Thread(target=self.scan_and_populate, daemon=True).start())
+        scan_btn.pack(side=tk.RIGHT, padx=(6, 0))
+        # Dark mode toggle
+        try:
+            self.dark_check = ttk.Checkbutton(top, text="Dark Mode", variable=self.dark_mode_var, command=self._on_theme_changed)
+            self.dark_check.pack(side=tk.RIGHT, padx=(6, 0))
+        except Exception:
+            try:
+                self.dark_check = tk.Checkbutton(top, text="Dark Mode", variable=self.dark_mode_var, command=self._on_theme_changed)
+                self.dark_check.pack(side=tk.RIGHT, padx=(6, 0))
+            except Exception:
+                pass
         # Search entry
         search_frame = ttk.Frame(self)
         search_frame.pack(fill=tk.X, padx=8)
@@ -159,6 +203,32 @@ class OsuMP3Browser(tk.Tk):
         self.stop_btn = ttk.Button(bottom, text="Stop", command=self.stop)
         self.stop_btn.pack(side=tk.LEFT)
 
+        # Volume control
+        self.volume_label = ttk.Label(bottom, text=f"Vol: {int(self.volume_var.get()*100)}%")
+        self.volume_label.pack(side=tk.LEFT, padx=(8, 4))
+        # Use a ttk.Scale for volume (0.0 - 1.0)
+        self.volume_scale = ttk.Scale(bottom, from_=0.0, to=1.0, orient=tk.HORIZONTAL,
+                          length=120, variable=self.volume_var,
+                          command=self.on_volume_change)
+        self.volume_scale.pack(side=tk.LEFT)
+
+        # Minimum duration spinbox
+        try:
+            # ttk.Spinbox is available in newer tkinter versions
+            self.min_label = ttk.Label(bottom, text="Min length (s):")
+            self.min_label.pack(side=tk.LEFT, padx=(8, 4))
+            self.min_spin = ttk.Spinbox(bottom, from_=0, to=3600, textvariable=self.min_duration_var, width=6, command=lambda: threading.Thread(target=self._on_min_duration_changed, daemon=True).start())
+            self.min_spin.pack(side=tk.LEFT)
+        except Exception:
+            # fallback to tk.Spinbox
+            try:
+                self.min_label = ttk.Label(bottom, text="Min length (s):")
+                self.min_label.pack(side=tk.LEFT, padx=(8, 4))
+                self.min_spin = tk.Spinbox(bottom, from_=0, to=3600, textvariable=self.min_duration_var, width=6, command=lambda: threading.Thread(target=self._on_min_duration_changed, daemon=True).start())
+                self.min_spin.pack(side=tk.LEFT)
+            except Exception:
+                pass
+
         self.current_label = ttk.Label(bottom, text="Not playing")
         self.current_label.pack(side=tk.RIGHT)
 
@@ -168,6 +238,347 @@ class OsuMP3Browser(tk.Tk):
         self.paused = False
         # metadata cache: path -> dict
         self._metadata = {}
+        # counter for excluded short files during scanning (updated on main thread)
+        self._excluded_short = 0
+        # persistent cache file path
+        try:
+            self.cache_path = Path.home() / CACHE_FILENAME
+        except Exception:
+            self.cache_path = Path(CACHE_FILENAME)
+
+        # try to load existing cache so UI can populate faster (also loads theme)
+        try:
+            self._load_cache()
+            # apply theme from cache before showing UI
+            try:
+                self.apply_theme()
+            except Exception:
+                pass
+            # apply cached entries to UI immediately
+            try:
+                self.after(0, self._apply_cache_to_ui)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _begin_scan_ui(self):
+        # Clear current visible lists and show scanning state (must run on main thread)
+        try:
+            self.listbox.delete(0, tk.END)
+        except Exception:
+            pass
+        try:
+            self.mp3_paths.clear()
+        except Exception:
+            pass
+        try:
+            self.all_mp3_paths.clear()
+        except Exception:
+            pass
+        self._excluded_short = 0
+        try:
+            self.current_label.config(text="Scanning...")
+        except Exception:
+            pass
+
+    def _apply_cache_to_ui(self):
+        """Populate the visible list from the loaded cache quickly (main thread)."""
+        try:
+            # Clear current visible lists
+            try:
+                self.listbox.delete(0, tk.END)
+            except Exception:
+                pass
+            self.mp3_paths.clear()
+            for path, folder_title in self.all_mp3_paths:
+                # populate seen set from cache so future scans don't duplicate
+                try:
+                    self._seen_paths.add(str(path))
+                except Exception:
+                    pass
+                # apply current search filter
+                q = (self.search_var.get() or '').strip().lower()
+                if q:
+                    meta = self._metadata.get(str(path), {})
+                    searchable = [folder_title.lower(), str(meta.get('title') or '').lower(), str(meta.get('artist') or '').lower()]
+                    if not any(q in s for s in searchable):
+                        continue
+                self.mp3_paths.append((path, folder_title))
+                try:
+                    self.listbox.insert(tk.END, folder_title)
+                except Exception:
+                    pass
+            try:
+                self.current_label.config(text=f"Found {len(self.all_mp3_paths)} audio files (cached)")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def apply_theme(self):
+        """Apply the chosen theme (dark/light) to the UI widgets and ttk styles."""
+        try:
+            dark = bool(self.dark_mode_var.get())
+            style = ttk.Style()
+            # prefer 'clam' theme for better style control where available
+            try:
+                style.theme_use('clam')
+            except Exception:
+                try:
+                    style.theme_use('default')
+                except Exception:
+                    pass
+
+            if dark:
+                # explicit dark palette
+                bg = '#2e2e2e'
+                fg = '#eaeaea'
+                entry_bg = '#3a3a3a'
+                list_bg = '#1e1e1e'
+                select_bg = '#555555'
+                button_bg = '#3a3a3a'
+            else:
+                # explicit light palette (avoid None to prevent type issues)
+                bg = '#f0f0f0'
+                fg = '#000000'
+                entry_bg = '#ffffff'
+                list_bg = '#ffffff'
+                select_bg = '#3399ff'
+                button_bg = '#e0e0e0'
+
+            # configure ttk styles
+            try:
+                style.configure('TFrame', background=bg)
+                style.configure('TLabel', background=bg, foreground=fg)
+                style.configure('TButton', background=button_bg, foreground=fg)
+                style.configure('TEntry', fieldbackground=entry_bg, foreground=fg)
+                style.configure('Horizontal.TScale', background=bg)
+                style.configure('TScrollbar', background=bg)
+                # progressbar styling (may vary by platform)
+                try:
+                    style.configure('TProgressbar', troughcolor=bg, background=button_bg)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            # apply to some direct tk widgets
+            try:
+                self.configure(bg=bg)
+            except Exception:
+                pass
+            try:
+                self.listbox.config(bg=list_bg, fg=fg, selectbackground=select_bg, highlightbackground=bg)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_theme_changed(self):
+        """Callback when theme checkbox toggled: apply theme and save settings to cache."""
+        try:
+            self.apply_theme()
+        except Exception:
+            pass
+        try:
+            # save settings into cache immediately
+            self._save_cache()
+        except Exception:
+            pass
+
+    def _load_cache(self):
+        """Load cached discovery file if present and validate entries.
+        Cache format: list of {path, folder_title, meta: {...}} where meta may contain '__mtime' and '__size'.
+        """
+        try:
+            if not getattr(self, 'cache_path', None):
+                return
+            if not self.cache_path.exists():
+                return
+            try:
+                with self.cache_path.open('r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception:
+                return
+
+            # support both old-list format and new dict-with-settings format
+            settings = {}
+            if isinstance(data, dict):
+                settings = data.get('settings', {}) or {}
+                items = data.get('items') or data.get('out') or []
+            else:
+                items = data
+            # apply settings (e.g., dark mode)
+            try:
+                if settings.get('dark_mode') is not None:
+                    self.dark_mode_var.set(bool(settings.get('dark_mode')))
+            except Exception:
+                pass
+
+            # validate and load
+            self.all_mp3_paths.clear()
+            for rec in items:
+                try:
+                    p = Path(rec.get('path', ''))
+                    if not p.exists():
+                        continue
+                    st = p.stat()
+                    mtime = int(st.st_mtime)
+                    size = st.st_size
+                    meta = rec.get('meta', {}) or {}
+                    rec_mtime = int(meta.get('__mtime') or rec.get('mtime') or 0)
+                    rec_size = int(meta.get('__size') or rec.get('size') or 0)
+                    if rec_mtime and rec_size and rec_mtime == mtime and rec_size == size:
+                        folder_title = rec.get('folder_title') or strip_leading_numbers(p.parent.name)
+                        self.all_mp3_paths.append((p, folder_title))
+                        # keep metadata including internal markers
+                        meta['__mtime'] = mtime
+                        meta['__size'] = size
+                        self._metadata[str(p)] = dict(meta)
+                        try:
+                            self._seen_paths.add(str(p))
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+        except Exception:
+            return
+
+    def _save_cache(self):
+        """Persist current discovery results to cache for faster next startup."""
+        try:
+            if not getattr(self, 'cache_path', None):
+                return
+            out = []
+            for p, folder_title in self.all_mp3_paths:
+                try:
+                    key = str(p)
+                    meta = dict(self._metadata.get(key, {}))
+                    # ensure mtime/size stored
+                    try:
+                        st = p.stat()
+                        meta['__mtime'] = int(st.st_mtime)
+                        meta['__size'] = st.st_size
+                    except Exception:
+                        pass
+                    out.append({'path': key, 'folder_title': folder_title, 'meta': meta})
+                except Exception:
+                    continue
+            try:
+                payload = {'items': out, 'settings': {'dark_mode': bool(self.dark_mode_var.get())}}
+                with self.cache_path.open('w', encoding='utf-8') as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _inc_excluded_short(self):
+        try:
+            self._excluded_short += 1
+            # update status label
+            try:
+                min_d = self.min_duration_var.get() if hasattr(self, 'min_duration_var') else MIN_DURATION_SECONDS
+                self.current_label.config(text=f"Found {len(self.all_mp3_paths)} audio files (excluded {self._excluded_short} < {min_d}s)")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_min_duration_changed(self):
+        """Called when the min duration spinbox changes: trigger a re-scan so UI reflects new cutoff."""
+        try:
+            # kick off a background re-scan (scan_and_populate already schedules UI updates)
+            threading.Thread(target=self.scan_and_populate, daemon=True).start()
+        except Exception:
+            pass
+
+    def _add_discovered_file(self, full: Path, folder_title: str, meta: dict):
+        """Add a single discovered file to internal lists and the visible listbox (main thread)."""
+        try:
+            key = str(full)
+            # avoid adding duplicates if this path was already known/displayed
+            if key in self._seen_paths:
+                # still merge metadata if provided
+                try:
+                    if meta:
+                        self._metadata[key] = {**self._metadata.get(key, {}), **meta}
+                except Exception:
+                    pass
+                return
+
+            # Re-check duration here to avoid adding files that were mis-measured
+            try:
+                dur = meta.get('duration') if meta else 0
+            except Exception:
+                dur = 0
+            if not dur:
+                try:
+                    dur = self.ensure_duration(full)
+                except Exception:
+                    dur = 0
+            min_d = self.min_duration_var.get() if hasattr(self, 'min_duration_var') else MIN_DURATION_SECONDS
+            if dur and dur < min_d:
+                # count as excluded and do not add
+                try:
+                    self._inc_excluded_short()
+                except Exception:
+                    pass
+                return
+            key = str(full)
+            # mark as seen so future scans won't re-add
+            try:
+                self._seen_paths.add(key)
+            except Exception:
+                pass
+            # merge metadata for this file
+            try:
+                if meta:
+                    self._metadata[key] = meta
+            except Exception:
+                pass
+            # add to master list
+            try:
+                self.all_mp3_paths.append((full, folder_title))
+            except Exception:
+                pass
+
+            # decide if matches current search
+            q = (self.search_var.get() or '').strip().lower()
+            match = True
+            if q:
+                searchable = [folder_title.lower()]
+                try:
+                    if meta.get('title'):
+                        searchable.append(str(meta.get('title')).lower())
+                except Exception:
+                    pass
+                try:
+                    if meta.get('artist'):
+                        searchable.append(str(meta.get('artist')).lower())
+                except Exception:
+                    pass
+                match = any(q in s for s in searchable)
+
+            if match:
+                # add to visible list
+                try:
+                    self.mp3_paths.append((full, folder_title))
+                    self.listbox.insert(tk.END, folder_title)
+                except Exception:
+                    pass
+
+            # update status label with running count
+            try:
+                if self._excluded_short:
+                    self.current_label.config(text=f"Found {len(self.all_mp3_paths)} audio files (excluded {self._excluded_short} < {MIN_DURATION_SECONDS}s)")
+                else:
+                    self.current_label.config(text=f"Found {len(self.all_mp3_paths)} audio files")
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def browse_folder(self):
         path = filedialog.askdirectory(initialdir=str(self.songs_dir) if self.songs_dir.exists() else None)
@@ -177,35 +588,144 @@ class OsuMP3Browser(tk.Tk):
             threading.Thread(target=self.scan_and_populate, daemon=True).start()
 
     def scan_and_populate(self):
-        self.listbox.delete(0, tk.END)
-        self.mp3_paths.clear()
-        self.all_mp3_paths.clear()
-        if not self.songs_dir.exists():
-            self.listbox.insert(tk.END, "(Songs directory not found)")
+        # Perform file discovery and metadata retrieval on background thread,
+        # but apply UI updates on the main thread to avoid tkinter thread-safety issues.
+        try:
+            if not self.songs_dir.exists():
+                # schedule UI update to show not found
+                self.after(0, lambda: self.listbox.insert(tk.END, "(Songs directory not found)"))
+                return
+        except Exception as e:
+            print(f"Error checking songs_dir: {e}")
+            self.after(0, lambda: self.listbox.insert(tk.END, "(Songs directory error)"))
             return
 
-        # Walk subdirectories and collect mp3 files
-        for root, dirs, files in sorted(os_walk(self.songs_dir)):
-            for fn in files:
-                if fn.lower().endswith('.mp3'):
-                    full = Path(root) / fn
-                    # read metadata and cache (still useful for details panel)
-                    meta = get_mp3_metadata(full) if HAS_MUTAGEN else {}
-                    self._metadata[str(full)] = meta
-                    # derive display title from parent folder name (strip leading numbers)
-                    folder_title = strip_leading_numbers(full.parent.name)
-                    self.all_mp3_paths.append((full, folder_title))
-                    # visible list will be populated by refresh_list
+        # indicate scanning but do not clear the currently-displayed list;
+        # we want incremental discovery that preserves what's already shown
+        try:
+            self.after(0, lambda: self.current_label.config(text="Scanning..."))
+        except Exception:
+            pass
 
-        # populate visible list from full list (no filter)
-        self.refresh_list()
-        if not self.all_mp3_paths:
-            self.listbox.insert(tk.END, "(No mp3 files found in Songs directory)")
+        local_all = []
+        local_meta = {}
+        excluded_short = 0
+
+        # Process each folder and pick only the first supported audio file in it
+        for root, dirs, files in sorted(os_walk(self.songs_dir)):
+            try:
+                # find the first filename in sorted order that matches supported extensions
+                first_fn = None
+                for fn in sorted(files):
+                    if fn.lower().endswith(SUPPORTED_AUDIO_EXTS):
+                        first_fn = fn
+                        break
+                if not first_fn:
+                    continue
+                full = Path(root) / first_fn
+                # try to reuse cached metadata if file unchanged
+                key = str(full)
+                meta = {}
+                try:
+                    st = full.stat()
+                    mtime = int(st.st_mtime)
+                    size = st.st_size
+                except Exception:
+                    mtime = None
+                    size = None
+
+                cached = self._metadata.get(key)
+                if cached and mtime is not None and size is not None and cached.get('__mtime') == mtime and cached.get('__size') == size:
+                    # reuse cached metadata (strip internal keys when later used)
+                    meta = {k: v for k, v in cached.items() if not k.startswith('__')}
+                    # ensure we copy the internal markers into local_meta so save later keeps them
+                    local_meta[key] = dict(cached)
+                else:
+                    # read metadata (may be slow) into local dict
+                    meta = get_mp3_metadata(full) if HAS_MUTAGEN else {}
+                    # attach mtime/size markers for caching
+                    try:
+                        if mtime is not None:
+                            meta['__mtime'] = mtime
+                        if size is not None:
+                            meta['__size'] = size
+                    except Exception:
+                        pass
+                    local_meta[key] = dict(meta)
+                # ensure duration is known (may compute and cache). Prefer cached value.
+                dur = meta.get('duration') or 0
+                if not dur:
+                    try:
+                        dur = self.ensure_duration(full)
+                        # store duration into local_meta for saving
+                        try:
+                            local_meta[str(full)]['duration'] = dur
+                        except Exception:
+                            pass
+                    except Exception:
+                        dur = 0
+                # skip very short files (count as excluded)
+                min_d = self.min_duration_var.get() if hasattr(self, 'min_duration_var') else MIN_DURATION_SECONDS
+                if dur and dur < min_d:
+                    excluded_short += 1
+                    try:
+                        self.after(0, self._inc_excluded_short)
+                    except Exception:
+                        pass
+                    continue
+
+                folder_title = strip_leading_numbers(full.parent.name)
+                local_all.append((full, folder_title))
+                # add this file to the UI immediately
+                try:
+                    self.after(0, lambda f=full, t=folder_title, m=meta: self._add_discovered_file(f, t, m))
+                except Exception:
+                    pass
+            except Exception:
+                # ignore errors per-folder
+                continue
+
+        # Apply results to UI on main thread
+        def apply_results():
+            try:
+                # merge remaining metadata
+                try:
+                    self._metadata.update(local_meta)
+                except Exception:
+                    pass
+                # final status update
+                count = len(self.all_mp3_paths)
+                if count == 0:
+                    try:
+                        self.listbox.insert(tk.END, "(No audio files found in Songs directory)")
+                    except Exception:
+                        pass
+                if excluded_short:
+                    try:
+                        min_d = self.min_duration_var.get() if hasattr(self, 'min_duration_var') else MIN_DURATION_SECONDS
+                        self.current_label.config(text=f"Found {count} audio files (excluded {excluded_short} < {min_d}s)")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self.current_label.config(text=f"Found {count} audio files")
+                    except Exception:
+                        pass
+                print(f"scan_and_populate: found {count} audio files in {self.songs_dir} (excluded_short={excluded_short})")
+                try:
+                    # persist cache for faster startup next time
+                    self._save_cache()
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"Error applying scan results: {e}")
+
+        self.after(0, apply_results)
 
     def play_selected(self):
         idx = self.listbox.curselection()
         if not idx:
-            messagebox.showinfo("Select", "Please select an mp3 from the list.")
+            messagebox.showinfo("Select", "Please select an audio file from the list.")
             return
         index = idx[0]
         try:
@@ -391,6 +911,26 @@ class OsuMP3Browser(tk.Tk):
                 self.geometry(f"{w}x{h}")
             else:
                 self.state('zoomed')
+        except Exception:
+            pass
+
+    def on_volume_change(self, val):
+        """Callback for volume scale. `val` is a string from the scale command."""
+        try:
+            v = float(val)
+        except Exception:
+            try:
+                v = self.volume_var.get()
+            except Exception:
+                return
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.music.set_volume(v)
+        except Exception:
+            pass
+        try:
+            # update label
+            self.volume_label.config(text=f"Vol: {int(v*100)}%")
         except Exception:
             pass
 
