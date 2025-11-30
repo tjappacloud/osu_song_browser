@@ -31,15 +31,6 @@ A desktop application for browsing and playing audio files from your osu! Songs 
 pip install pygame mutagen pillow
 ```
 
-## Usage
-
-Run the application:
-
-```bash
-cd music_player
-python main.py
-```
-
 ## Project Structure
 
 ```
