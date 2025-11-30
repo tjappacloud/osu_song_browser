@@ -42,7 +42,11 @@ music_player/
 │   ├── metadata.py           # Audio metadata extraction
 │   ├── audio.py              # Audio playback wrapper
 │   └── ui.py                 # GUI implementation
-└── main.py                   # Application entry point
+├── main.py                   # Application entry point
+├── osutifylogo.ico
+├── requirements.txt
+├── .gitignore
+└── README.md
 ```
 
 ## Controls
