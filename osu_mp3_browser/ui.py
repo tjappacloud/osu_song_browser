@@ -2,6 +2,10 @@
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+try:
+    import tkinter.font as tkfont
+except Exception:
+    tkfont = None
 import threading
 import time
 import json
@@ -12,6 +16,7 @@ from .config import get_default_osu_songs_dir, SUPPORTED_AUDIO_EXTS, MIN_DURATIO
 from .utils import strip_leading_numbers, parse_artist_from_folder, format_duration, os_walk
 from .metadata import get_mp3_metadata, get_osu_background, ensure_duration
 from . import audio
+from .playlist import PlaylistStore
 
 # try to import Pillow for image thumbnails
 try:
@@ -118,10 +123,15 @@ class OsuMP3Browser(tk.Tk):
         list_container.pack(fill=tk.BOTH, expand=True)
 
         # listbox inside container using grid so hscroll sits under list and vscroll to right
-        self.listbox = tk.Listbox(list_container, activestyle='none')
+        self.listbox = tk.Listbox(list_container, activestyle='none', exportselection=False)
         self.listbox.grid(row=0, column=0, sticky='nsew')
         self.listbox.bind('<Double-1>', self.on_double_click)
         self.listbox.bind('<<ListboxSelect>>', self.on_select)
+        # Right-click context menu for adding to playlist
+        try:
+            self.listbox.bind('<Button-3>', self._on_song_right_click)
+        except Exception:
+            pass
 
         # vertical scrollbar
         try:
@@ -154,23 +164,31 @@ class OsuMP3Browser(tk.Tk):
         self.listbox.bind('<Motion>', self._on_listbox_motion)
         self.listbox.bind('<Leave>', self._hide_title_tooltip)
 
-        right = ttk.Frame(mid, width=240)
+        right = ttk.Frame(mid, width=480)
         right.pack(side=tk.RIGHT, fill=tk.Y)
-        # Background thumbnail (will be filled on selection)
+        # keep a reference for placing compact panels like Playlists
+        self.right_panel = right
+        # Background thumbnail (fixed-size to avoid layout shifts)
         self.meta_image_label = ttk.Label(right)
         self.meta_image_label.pack(anchor=tk.CENTER, padx=6, pady=6)
 
-        # Metadata labels
-        self.meta_title = ttk.Label(right, text="Title: ")
+        # Metadata labels: reserve two lines by default; longer per line; wrap safely
+        self._meta_label_width = 104  # approx chars per line (doubled)
+        self.meta_title = ttk.Label(right, text="Title: ", width=self._meta_label_width, wraplength=440, justify=tk.LEFT)
         self.meta_title.pack(anchor=tk.W, padx=6, pady=4)
-        self.meta_artist = ttk.Label(right, text="Artist: ")
+        self.meta_artist = ttk.Label(right, text="Artist: ", width=self._meta_label_width, wraplength=440, justify=tk.LEFT)
         self.meta_artist.pack(anchor=tk.W, padx=6, pady=4)
-        self.meta_album = ttk.Label(right, text="Album: ")
+        self.meta_album = ttk.Label(right, text="Album: ", width=self._meta_label_width, wraplength=440, justify=tk.LEFT)
         self.meta_album.pack(anchor=tk.W, padx=6, pady=4)
-        self.meta_duration = ttk.Label(right, text="Duration: ")
+        self.meta_duration = ttk.Label(right, text="Duration: ", width=self._meta_label_width, wraplength=440, justify=tk.LEFT)
         self.meta_duration.pack(anchor=tk.W, padx=6, pady=4)
-        self.meta_path = ttk.Label(right, text="Path: ", wraplength=220)
+        self.meta_path = ttk.Label(right, text="Path: ", width=self._meta_label_width, wraplength=440, justify=tk.LEFT)
         self.meta_path.pack(anchor=tk.W, padx=6, pady=4)
+        try:
+            self.meta_path.bind('<Enter>', self._on_meta_path_enter)
+            self.meta_path.bind('<Leave>', self._on_meta_path_leave)
+        except Exception:
+            pass
 
         bottom = ttk.Frame(self)
         bottom.pack(fill=tk.X, padx=8, pady=6)
@@ -190,6 +208,27 @@ class OsuMP3Browser(tk.Tk):
         self.progress.pack(fill=tk.X, pady=(4, 0))
         self.time_label = ttk.Label(now_right, text="0:00 / 0:00")
         self.time_label.pack(anchor=tk.W)
+        # Prepare fixed-size placeholder images to prevent layout shifts when images change
+        try:
+            self._now_img_size = (120, 80)
+            self._meta_img_size = (220, 140)
+            # Create placeholders using PIL when available, else Tk PhotoImage
+            def _mk_placeholder(size):
+                w, h = size
+                try:
+                    return tk.PhotoImage(width=w, height=h)
+                except Exception:
+                    return None
+            self._now_placeholder = _mk_placeholder(self._now_img_size)
+            self._meta_placeholder = _mk_placeholder(self._meta_img_size)
+            if self._now_placeholder is not None:
+                self.now_image_label.config(image=self._now_placeholder)
+                setattr(self.now_image_label, '_photo_ref', self._now_placeholder)
+            if self._meta_placeholder is not None:
+                self.meta_image_label.config(image=self._meta_placeholder)
+                setattr(self.meta_image_label, '_photo_ref', self._meta_placeholder)
+        except Exception:
+            pass
         # playback tracking
         self._playing_path = None
         self._progress_after_id = None
@@ -262,6 +301,10 @@ class OsuMP3Browser(tk.Tk):
         self.after(100, lambda: threading.Thread(target=self.scan_and_populate, daemon=True).start())
 
         self.paused = False
+        # playlist playback state flag
+        self._playlist_runner_active = False
+        self._playlist_cancelled = False
+        self._playlist_skip_requested = False
         # metadata cache: path -> dict
         self._metadata = {}
         # counter for excluded short files during scanning (updated on main thread)
@@ -271,6 +314,12 @@ class OsuMP3Browser(tk.Tk):
             self.cache_path = Path.home() / CACHE_FILENAME
         except Exception:
             self.cache_path = Path(CACHE_FILENAME)
+
+        # Playlists store
+        try:
+            self.playlists = PlaylistStore()
+        except Exception:
+            self.playlists = PlaylistStore(storage_path=Path(".osu_song_browser_playlists.json"))
 
         # try to load existing cache so UI can populate faster (also loads theme)
         try:
@@ -285,6 +334,670 @@ class OsuMP3Browser(tk.Tk):
                 self.after(0, self._apply_cache_to_ui)
             except Exception:
                 pass
+        except Exception:
+            pass
+
+        # --- Playlists UI ---
+        try:
+            self._init_playlists_ui()
+        except Exception:
+            pass
+
+        # Ensure theme is applied after all widgets are created
+        try:
+            self.after(0, self.apply_theme)
+        except Exception:
+            pass
+
+        # Build context menu after playlists init
+        try:
+            self._build_song_context_menu()
+        except Exception:
+            pass
+
+    def _init_playlists_ui(self):
+        """Create a compact playlists section inside the right panel."""
+        parent = getattr(self, 'right_panel', self)
+        pl_frame = ttk.LabelFrame(parent, text="Playlists")
+        pl_frame.pack(fill=tk.X, padx=6, pady=6)
+
+        row = ttk.Frame(pl_frame)
+        row.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Label(row, text="Name:").pack(side=tk.LEFT)
+        self.playlist_name_var = tk.StringVar()
+        ttk.Entry(row, textvariable=self.playlist_name_var, width=24).pack(side=tk.LEFT, padx=6)
+        ttk.Button(row, text="Create", command=self._on_create_playlist).pack(side=tk.LEFT)
+
+        list_row = ttk.Frame(pl_frame)
+        list_row.pack(fill=tk.X, padx=6)
+        # smaller listbox height to reduce footprint
+        self.playlist_listbox = tk.Listbox(list_row, height=4, exportselection=False)
+        self.playlist_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        try:
+            pl_scroll = ttk.Scrollbar(list_row, orient=tk.VERTICAL, command=self.playlist_listbox.yview)
+        except Exception:
+            pl_scroll = tk.Scrollbar(list_row, orient=tk.VERTICAL, command=self.playlist_listbox.yview)
+        pl_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.playlist_listbox.config(yscrollcommand=pl_scroll.set)
+        # refresh tracks when a playlist is selected
+        try:
+            self.playlist_listbox.bind('<<ListboxSelect>>', self._on_playlist_select)
+        except Exception:
+            pass
+
+        btns = ttk.Frame(pl_frame)
+        btns.pack(fill=tk.X, padx=6, pady=4)
+        # Target playlist dropdown to avoid changing selection focus
+        ttk.Label(btns, text="Target:").pack(side=tk.LEFT)
+        self.playlist_target_var = tk.StringVar()
+        self.playlist_target_combo = ttk.Combobox(btns, textvariable=self.playlist_target_var, state='readonly', width=18)
+        self.playlist_target_combo.pack(side=tk.LEFT, padx=(4, 8))
+        try:
+            self.playlist_target_combo.bind('<<ComboboxSelected>>', self._on_target_playlist_changed)
+        except Exception:
+            pass
+        ttk.Button(btns, text="Add Selected Song", command=self._on_add_selected_to_playlist).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Play Playlist", command=self._on_play_playlist).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Delete", command=self._on_delete_playlist).pack(side=tk.RIGHT)
+
+        # Inline status area for playlist actions (avoids popups)
+        self._playlist_status_after_id = None
+        self.playlist_status = ttk.Label(pl_frame, text="")
+        self.playlist_status.pack(fill=tk.X, padx=6, pady=(2, 2))
+
+        # Tracks list for selected playlist
+        tracks_lbl = ttk.Label(pl_frame, text="Tracks:")
+        tracks_lbl.pack(anchor=tk.W, padx=6, pady=(2, 0))
+        tracks_row = ttk.Frame(pl_frame)
+        tracks_row.pack(fill=tk.BOTH, expand=False, padx=6)
+        self.playlist_tracks_listbox = tk.Listbox(tracks_row, height=6, exportselection=False)
+        self.playlist_tracks_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        try:
+            tracks_scroll = ttk.Scrollbar(tracks_row, orient=tk.VERTICAL, command=self.playlist_tracks_listbox.yview)
+        except Exception:
+            tracks_scroll = tk.Scrollbar(tracks_row, orient=tk.VERTICAL, command=self.playlist_tracks_listbox.yview)
+        tracks_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.playlist_tracks_listbox.config(yscrollcommand=tracks_scroll.set)
+        try:
+            self.playlist_tracks_listbox.bind('<Double-1>', self._on_playlist_track_double_click)
+        except Exception:
+            pass
+        try:
+            self.playlist_tracks_listbox.bind('<<ListboxSelect>>', self._on_playlist_track_select)
+        except Exception:
+            pass
+        # keep metadata wrap aligned with playlist listbox width
+        try:
+            self.playlist_tracks_listbox.bind('<Configure>', self._on_playlist_tracks_resize)
+        except Exception:
+            pass
+        # current displayed tracks as paths
+        self._current_playlist_tracks = []
+
+        # populate initial list
+        self._refresh_playlists_list()
+
+    def _refresh_playlists_list(self):
+        try:
+            # preserve selection name
+            cur_sel_name = self._get_selected_playlist_name()
+            self.playlist_listbox.delete(0, tk.END)
+            names = self.playlists.list_names() if self.playlists else []
+            for n in names:
+                self.playlist_listbox.insert(tk.END, n)
+            # restore selection if possible
+            if cur_sel_name and cur_sel_name in names:
+                try:
+                    idx = names.index(cur_sel_name)
+                    self.playlist_listbox.selection_set(idx)
+                    self.playlist_listbox.activate(idx)
+                except Exception:
+                    pass
+            # also refresh dropdown
+            try:
+                self.playlist_target_combo['values'] = names
+                # preserve selection if possible
+                cur = self.playlist_target_var.get()
+                if cur not in names:
+                    self.playlist_target_var.set(names[0] if names else '')
+            except Exception:
+                pass
+            # refresh context menu submenu
+            try:
+                self._build_song_context_menu()
+            except Exception:
+                pass
+            # refresh tracks view if a playlist is selected
+            try:
+                cur_name = self._get_selected_playlist_name()
+                if cur_name:
+                    self._refresh_playlist_tracks(cur_name)
+                else:
+                    self._refresh_playlist_tracks(None)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_create_playlist(self):
+        name = (self.playlist_name_var.get() or '').strip()
+        if not name:
+            self._set_playlist_status("Enter a playlist name")
+            return
+        try:
+            if self.playlists:
+                self.playlists.create(name)
+                self._refresh_playlists_list()
+                self.playlist_name_var.set('')
+                self._set_playlist_status(f"Created playlist '{name}'")
+        except Exception as e:
+            self._set_playlist_status(f"Create failed: {e}")
+
+    def _get_selected_song_path(self):
+        try:
+            sel = self.listbox.curselection()
+            if not sel:
+                return None
+            idx = sel[0]
+            path, _title = self.mp3_paths[idx]
+            return str(path)
+        except Exception:
+            return None
+
+    def _get_selected_playlist_name(self):
+        try:
+            sel = self.playlist_listbox.curselection()
+            if not sel:
+                return None
+            return self.playlist_listbox.get(sel[0])
+        except Exception:
+            return None
+
+    def _on_add_selected_to_playlist(self):
+        # Prefer dropdown selection; fallback to listbox
+        pl_name = (self.playlist_target_var.get() or '').strip()
+        if not pl_name:
+            pl_name = self._get_selected_playlist_name()
+        if not pl_name:
+            self._set_playlist_status("Select a playlist (dropdown or list)")
+            return
+        song = self._get_selected_song_path()
+        if not song:
+            self._set_playlist_status("Select a song in the list")
+            return
+        try:
+            if self.playlists:
+                self.playlists.add_track(pl_name, song)
+                self._set_playlist_status(f"Added to '{pl_name}'")
+                # refresh track list if editing current playlist
+                try:
+                    cur_name = self._get_selected_playlist_name()
+                    if cur_name == pl_name:
+                        self._refresh_playlist_tracks(pl_name)
+                except Exception:
+                    pass
+        except Exception as e:
+            self._set_playlist_status(f"Add failed: {e}")
+
+    def _on_delete_playlist(self):
+        pl_name = self._get_selected_playlist_name()
+        if not pl_name:
+            return
+        try:
+            if self.playlists:
+                self.playlists.delete(pl_name)
+                self._refresh_playlists_list()
+                self._set_playlist_status(f"Deleted '{pl_name}'")
+        except Exception as e:
+            self._set_playlist_status(f"Delete failed: {e}")
+
+    def _on_play_playlist(self):
+        pl_name = self._get_selected_playlist_name()
+        if not pl_name:
+            self._set_playlist_status("Select a playlist to play")
+            return
+        pl = self.playlists.get(pl_name) if self.playlists else None
+        if not pl or not pl.tracks:
+            self._set_playlist_status("Playlist is empty")
+            return
+        # play sequentially using existing controls
+        self._play_playlist_tracks(list(pl.tracks))
+
+    def _on_playlist_select(self, event):
+        try:
+            name = self._get_selected_playlist_name()
+            # keep target dropdown in sync with list selection
+            if name:
+                try:
+                    self.playlist_target_var.set(name)
+                except Exception:
+                    pass
+            self._refresh_playlist_tracks(name)
+        except Exception:
+            pass
+
+    def _refresh_playlist_tracks(self, name):
+        try:
+            self.playlist_tracks_listbox.delete(0, tk.END)
+            self._current_playlist_tracks = []
+            if not name or not self.playlists:
+                return
+            pl = self.playlists.get(name)
+            if not pl:
+                return
+            for p in pl.tracks:
+                try:
+                    path = Path(p)
+                except Exception:
+                    path = None
+                display = str(p)
+                if path is not None:
+                    folder = path.parent.name if path.parent else path.name
+                    display = strip_leading_numbers(folder)
+                self.playlist_tracks_listbox.insert(tk.END, display)
+                self._current_playlist_tracks.append(str(p))
+        except Exception:
+            pass
+
+    def _on_playlist_track_double_click(self, event):
+        try:
+            sel = self.playlist_tracks_listbox.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            if 0 <= idx < len(self._current_playlist_tracks):
+                # Start playlist-mode playback from the double-clicked track and wrap around
+                try:
+                    # Cancel any existing playlist runner
+                    self._playlist_cancelled = True
+                except Exception:
+                    pass
+                try:
+                    tracks = list(self._current_playlist_tracks)
+                    if not tracks:
+                        return
+                    self._play_playlist_tracks(tracks, start_index=idx, wrap=True)
+                except Exception:
+                    # Fallback: play only this track in playlist context
+                    p = self._current_playlist_tracks[idx]
+                    self._play_path(Path(p), from_playlist=True)
+        except Exception:
+            pass
+
+    def _on_playlist_track_select(self, event):
+        try:
+            sel = self.playlist_tracks_listbox.curselection()
+            if not sel:
+                return
+            idx = sel[0]
+            if 0 <= idx < len(self._current_playlist_tracks):
+                p = self._current_playlist_tracks[idx]
+                self._update_meta_display(Path(p))
+        except Exception:
+            pass
+
+    def _select_playlist_track_by_path(self, path: Path):
+        """Select the given path in the playlist tracks list if it is displayed."""
+        try:
+            if not hasattr(self, 'playlist_tracks_listbox') or self.playlist_tracks_listbox is None:
+                return
+            if not hasattr(self, '_current_playlist_tracks') or not self._current_playlist_tracks:
+                return
+            target = str(path)
+            idx = None
+            for i, p in enumerate(self._current_playlist_tracks):
+                try:
+                    if str(Path(p)) == str(Path(target)):
+                        idx = i
+                        break
+                except Exception:
+                    if p == target:
+                        idx = i
+                        break
+            if idx is not None:
+                try:
+                    self.playlist_tracks_listbox.selection_clear(0, tk.END)
+                except Exception:
+                    pass
+                try:
+                    self.playlist_tracks_listbox.selection_set(idx)
+                    self.playlist_tracks_listbox.activate(idx)
+                    self.playlist_tracks_listbox.see(idx)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _on_target_playlist_changed(self, event):
+        """Sync list selection and tracks view when target combobox changes."""
+        try:
+            name = (self.playlist_target_var.get() or '').strip()
+            if not name:
+                return
+            # Find the matching index in the playlist listbox and select it
+            try:
+                items = [self.playlist_listbox.get(i) for i in range(self.playlist_listbox.size())]
+                if name in items:
+                    idx = items.index(name)
+                    self.playlist_listbox.selection_clear(0, tk.END)
+                    self.playlist_listbox.selection_set(idx)
+                    self.playlist_listbox.activate(idx)
+            except Exception:
+                pass
+            # Refresh tracks for the chosen playlist
+            self._refresh_playlist_tracks(name)
+        except Exception:
+            pass
+
+    def _on_playlist_tracks_resize(self, event=None):
+        """Keep metadata wraplength and character width aligned to playlist list box width."""
+        try:
+            width_px = None
+            try:
+                if event is not None and hasattr(event, 'width'):
+                    width_px = int(event.width)
+            except Exception:
+                width_px = None
+            if width_px is None:
+                try:
+                    width_px = int(self.playlist_tracks_listbox.winfo_width())
+                except Exception:
+                    return
+
+            # Update wraplength for all metadata labels
+            for lbl in (self.meta_title, self.meta_artist, self.meta_album, self.meta_duration, self.meta_path):
+                try:
+                    lbl.config(wraplength=width_px)
+                except Exception:
+                    pass
+
+            # Estimate characters per line from current font
+            per_line_chars = None
+            try:
+                if tkfont is not None:
+                    f = tkfont.nametofont('TkDefaultFont')
+                    sample = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+                    px = max(1, f.measure(sample))
+                    avg = px / len(sample)
+                    per_line_chars = max(10, int(width_px / max(1, avg)))
+            except Exception:
+                per_line_chars = None
+            if per_line_chars is None:
+                # fallback heuristic: ~8px per char
+                per_line_chars = max(10, int(width_px / 8))
+
+            # Apply width in characters for label widgets (stabilize width)
+            try:
+                self._meta_label_width = per_line_chars
+            except Exception:
+                pass
+            for lbl in (self.meta_title, self.meta_artist, self.meta_album, self.meta_duration, self.meta_path):
+                try:
+                    lbl.config(width=self._meta_label_width)
+                except Exception:
+                    pass
+
+            # Refresh current meta texts to honor new widths (if a path is selected/playing)
+            try:
+                path = getattr(self, '_playing_path', None)
+                if path is not None:
+                    self._update_meta_display(path)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _set_playlist_status(self, text: str, duration_ms: int = 2500):
+        """Show a transient status message in the playlist area without using popups."""
+        try:
+            if not hasattr(self, 'playlist_status') or self.playlist_status is None:
+                return
+            self.playlist_status.config(text=text)
+            # cancel previous scheduled clear
+            try:
+                if self._playlist_status_after_id:
+                    self.after_cancel(self._playlist_status_after_id)
+            except Exception:
+                pass
+            # schedule clear
+            self._playlist_status_after_id = self.after(duration_ms, lambda: self.playlist_status.config(text=""))
+        except Exception:
+            pass
+
+    def _play_playlist_tracks(self, tracks: list[str], start_index: int | None = None, wrap: bool = True):
+        # basic sequential playback using existing audio functions
+        def _runner():
+            self._playlist_runner_active = True
+            self._playlist_cancelled = False
+            
+            def make_order(first_cycle: bool = False):
+                try:
+                    base = list(tracks)
+                except Exception:
+                    base = list(tracks) if tracks else []
+                if not base:
+                    return []
+                # Shuffle mode: if starting from a specific index on first cycle, play that first then shuffle the rest
+                if self.play_mode == 'shuffle':
+                    if first_cycle and start_index is not None and 0 <= start_index < len(base):
+                        try:
+                            first = base[start_index]
+                            rest = base[:start_index] + base[start_index+1:]
+                        except Exception:
+                            first = base[0]
+                            rest = base[1:]
+                        try:
+                            random.shuffle(rest)
+                        except Exception:
+                            pass
+                        return [first] + rest
+                    # subsequent cycles or no start index: pure shuffle of full list
+                    try:
+                        random.shuffle(base)
+                    except Exception:
+                        pass
+                    return base
+                # Sequential mode
+                if first_cycle and start_index is not None and 0 <= start_index < len(base):
+                    return base[start_index:] + base[:start_index]
+                return base
+
+            # Build initial order (respect start index on first cycle only)
+            order = make_order(first_cycle=True)
+            last_started = None
+            while not self._playlist_cancelled:
+                for p in order:
+                    if self._playlist_cancelled:
+                        break
+                    try:
+                        # Start playback on the main thread via _play_path to ensure
+                        # progress bar and thumbnail update correctly.
+                        started = threading.Event()
+                        def _start_on_main(path_str=p):
+                            try:
+                                self._play_path(Path(path_str), from_playlist=True)
+                            finally:
+                                started.set()
+                        self.after(0, _start_on_main)
+                        started.wait(timeout=2.0)
+                        last_started = Path(p)
+                        # Wait until track finishes; do not advance while paused
+                        while True:
+                            try:
+                                if self._playlist_skip_requested:
+                                    # consume skip and stop current, advance to next
+                                    self._playlist_skip_requested = False
+                                    try:
+                                        audio.stop()
+                                    except Exception:
+                                        pass
+                                    time.sleep(0.05)
+                                    break
+                                if self._playlist_cancelled:
+                                    break
+                                if getattr(self, 'paused', False):
+                                    time.sleep(0.1)
+                                    continue
+                                if not audio.is_busy():
+                                    break
+                                time.sleep(0.2)
+                            except Exception:
+                                break
+                    except Exception:
+                        continue
+                if not wrap:
+                    break
+                # Build next cycle order: ignore start_index from here on
+                order = make_order(first_cycle=False)
+            # reset when done
+            self._playlist_runner_active = False
+            if not self._playlist_cancelled:
+                # Only clear playing state if we finished naturally
+                try:
+                    if last_started is None or self._playing_path == last_started:
+                        self._playing_path = None
+                        self.after(0, lambda: self.current_label.config(text="Not playing"))
+                except Exception:
+                    pass
+        threading.Thread(target=_runner, daemon=True).start()
+
+    def _update_now_labels(self, path: Path):
+        try:
+            # Use folder name formatting like the main list
+            folder = path.parent.name if path.parent else path.name
+            display = strip_leading_numbers(folder)
+            self.now_title_label.config(text=f"Now: {display}")
+            self.current_label.config(text=display)
+        except Exception:
+            pass
+
+    # --- Meta label formatting helpers to prevent layout shifts ---
+    def _ellipsize_end(self, text: str, max_chars: int) -> str:
+        try:
+            s = str(text or '')
+            if max_chars is None or len(s) <= max_chars:
+                return s
+            if max_chars <= 1:
+                return '…'
+            return s[: max_chars - 1] + '…'
+        except Exception:
+            return str(text)
+
+    def _ellipsize_middle(self, text: str, max_chars: int) -> str:
+        try:
+            s = str(text or '')
+            if max_chars is None or len(s) <= max_chars:
+                return s
+            if max_chars <= 1:
+                return '…'
+            head = (max_chars - 1) // 2
+            tail = (max_chars - 1) - head
+            return s[:head] + '…' + s[-tail:]
+        except Exception:
+            return str(text)
+
+    def _format_meta_line(self, prefix: str, value: str, max_chars: int, middle: bool = False) -> str:
+        try:
+            body = self._ellipsize_middle(value, max_chars) if middle else self._ellipsize_end(value, max_chars)
+            return f"{prefix}{body}"
+        except Exception:
+            return f"{prefix}{value}"
+
+    def _format_meta_two_lines(self, prefix: str, value: str, per_line_chars: int, middle: bool = False) -> str:
+        """Return up to two lines of text with optional ellipsis.
+        - per_line_chars: approx characters per line
+        - middle=True uses middle ellipsis on second line (useful for paths)
+        Always returns exactly two lines (second may be empty) to stabilize layout.
+        """
+        try:
+            s = str(value or '')
+            avail1 = max(0, per_line_chars - len(prefix))
+            # Make second line the same length as the top line's content area
+            avail2 = max(0, per_line_chars - len(prefix))
+            if not s:
+                return f"{prefix}\n"
+
+            if middle:
+                if len(s) <= avail1:
+                    return f"{prefix}{s}\n"
+                if len(s) <= avail1 + avail2:
+                    l1 = s[:avail1]
+                    l2 = s[avail1:]
+                    return f"{prefix}{l1}\n{l2}"
+                l1 = s[:avail1]
+                tail_len = max(0, avail2 - 1)
+                l2 = ('…' + s[-tail_len:]) if tail_len > 0 else '…'
+                return f"{prefix}{l1}\n{l2}"
+            else:
+                if len(s) <= avail1:
+                    return f"{prefix}{s}\n"
+                if len(s) <= avail1 + avail2:
+                    l1 = s[:avail1]
+                    l2 = s[avail1:]
+                    return f"{prefix}{l1}\n{l2}"
+                l1 = s[:avail1]
+                l2 = s[avail1:avail1 + max(0, avail2 - 1)] + '…'
+                return f"{prefix}{l1}\n{l2}"
+        except Exception:
+            try:
+                return f"{prefix}{value}\n"
+            except Exception:
+                return f"{prefix}\n"
+
+    # --- Context menu for songs ---
+    def _build_song_context_menu(self):
+        try:
+            # Base menu
+            self.song_menu = tk.Menu(self, tearoff=0)
+            # Submenu for playlists
+            self.song_menu_playlists = tk.Menu(self.song_menu, tearoff=0)
+            names = self.playlists.list_names() if self.playlists else []
+            if names:
+                for name in names:
+                    self.song_menu_playlists.add_command(
+                        label=name,
+                        command=lambda n=name: self._add_current_hover_to_playlist(n)
+                    )
+            else:
+                self.song_menu_playlists.add_command(label="No playlists", state=tk.DISABLED)
+            self.song_menu.add_cascade(label="Add to playlist", menu=self.song_menu_playlists)
+        except Exception:
+            pass
+
+    def _on_song_right_click(self, event):
+        try:
+            # Select the row under mouse
+            index = self.listbox.nearest(event.y)
+            if index is not None:
+                try:
+                    self.listbox.selection_clear(0, tk.END)
+                except Exception:
+                    pass
+                self.listbox.selection_set(index)
+                self.listbox.activate(index)
+                # Track hover index for adding via context menu
+                self._last_hover_index = index
+            # Show the menu
+            try:
+                self.song_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.song_menu.grab_release()
+        except Exception:
+            pass
+
+    def _add_current_hover_to_playlist(self, playlist_name: str):
+        try:
+            idx = getattr(self, '_last_hover_index', None)
+            if idx is None:
+                # fallback to current selection
+                sel = self.listbox.curselection()
+                if not sel:
+                    return
+                idx = sel[0]
+            path, _title = self.mp3_paths[idx]
+            if self.playlists:
+                self.playlists.add_track(playlist_name, str(path))
+                messagebox.showinfo("Playlist", f"Added to '{playlist_name}'.")
         except Exception:
             pass
 
@@ -371,6 +1084,7 @@ class OsuMP3Browser(tk.Tk):
                 list_bg = '#1e1e1e'
                 select_bg = '#555555'
                 button_bg = '#3a3a3a'
+                border = '#3f3f3f'
             else:
                 # explicit light palette (avoid None to prevent type issues)
                 bg = '#f0f0f0'
@@ -379,6 +1093,7 @@ class OsuMP3Browser(tk.Tk):
                 list_bg = '#ffffff'
                 select_bg = '#3399ff'
                 button_bg = '#e0e0e0'
+                border = '#c9c9c9'
 
             # configure ttk styles
             try:
@@ -386,6 +1101,18 @@ class OsuMP3Browser(tk.Tk):
                 style.configure('TLabel', background=bg, foreground=fg)
                 style.configure('TButton', background=button_bg, foreground=fg)
                 style.configure('TEntry', fieldbackground=entry_bg, foreground=fg)
+                # Combobox styling
+                style.configure('TCombobox', fieldbackground=entry_bg, foreground=fg, background=bg)
+                style.configure('Playlist.TCombobox', fieldbackground=entry_bg, foreground=fg, background=bg)
+                try:
+                    style.map('Playlist.TCombobox',
+                              fieldbackground=[('readonly', entry_bg), ('!readonly', entry_bg)],
+                              foreground=[('disabled', '#888888'), ('!disabled', fg)],
+                              background=[('active', button_bg), ('!active', bg)])
+                except Exception:
+                    pass
+                style.configure('TLabelframe', background=bg, foreground=fg, bordercolor=border)
+                style.configure('TLabelframe.Label', background=bg, foreground=fg)
                 style.configure('Horizontal.TScale', background=bg)
                 style.configure('TScrollbar', background=bg)
                 # progressbar styling (may vary by platform)
@@ -396,13 +1123,57 @@ class OsuMP3Browser(tk.Tk):
             except Exception:
                 pass
 
+            # Ensure ttk Combobox dropdown list matches theme via option database
+            try:
+                self.option_add('*TCombobox*Listbox.background', list_bg)
+                self.option_add('*TCombobox*Listbox.foreground', fg)
+                self.option_add('*TCombobox*Listbox.selectBackground', select_bg)
+                self.option_add('*TCombobox*Listbox.selectForeground', fg)
+                self.option_add('*TCombobox*Listbox.highlightBackground', bg)
+            except Exception:
+                pass
+
             # apply to some direct tk widgets
             try:
                 self.configure(bg=bg)
             except Exception:
                 pass
+            # Apply custom style to target combobox, if present
             try:
-                self.listbox.config(bg=list_bg, fg=fg, selectbackground=select_bg, highlightbackground=bg)
+                if hasattr(self, 'playlist_target_combo') and self.playlist_target_combo:
+                    self.playlist_target_combo.configure(style='Playlist.TCombobox')
+            except Exception:
+                pass
+            try:
+                # Ensure listbox interior matches theme fully (set options individually)
+                self.listbox.config(bg=list_bg)
+                self.listbox.config(fg=fg)
+                self.listbox.config(selectbackground=select_bg)
+                self.listbox.config(selectforeground=fg)
+                self.listbox.config(highlightbackground=bg)
+                self.listbox.config(highlightcolor=bg)
+                # skip insertbackground to avoid type-check complaints
+            except Exception:
+                pass
+            try:
+                if hasattr(self, 'playlist_listbox') and self.playlist_listbox:
+                    self.playlist_listbox.config(bg=list_bg)
+                    self.playlist_listbox.config(fg=fg)
+                    self.playlist_listbox.config(selectbackground=select_bg)
+                    self.playlist_listbox.config(selectforeground=fg)
+                    self.playlist_listbox.config(highlightbackground=bg)
+                    self.playlist_listbox.config(highlightcolor=bg)
+                    # skip insertbackground to avoid type-check complaints
+            except Exception:
+                pass
+            try:
+                if hasattr(self, 'playlist_tracks_listbox') and self.playlist_tracks_listbox:
+                    self.playlist_tracks_listbox.config(bg=list_bg)
+                    self.playlist_tracks_listbox.config(fg=fg)
+                    self.playlist_tracks_listbox.config(selectbackground=select_bg)
+                    self.playlist_tracks_listbox.config(selectforeground=fg)
+                    self.playlist_tracks_listbox.config(highlightbackground=bg)
+                    self.playlist_tracks_listbox.config(highlightcolor=bg)
             except Exception:
                 pass
         except Exception:
@@ -748,9 +1519,31 @@ class OsuMP3Browser(tk.Tk):
         self.after(0, apply_results)
 
     def play_selected(self):
+        # Prefer main list selection; fallback to playlist track selection
+        idx = self.listbox.curselection()
+        if idx:
+            index = idx[0]
+            try:
+                path = self.mp3_paths[index][0]
+            except IndexError:
+                return
+            self._play_path(path)
+            return
+        try:
+            tr_sel = self.playlist_tracks_listbox.curselection()
+        except Exception:
+            tr_sel = ()
+        if tr_sel:
+            tindex = tr_sel[0]
+            if 0 <= tindex < len(self._current_playlist_tracks):
+                self._play_path(Path(self._current_playlist_tracks[tindex]))
+                return
+        messagebox.showinfo("Select", "Please select an audio file from the list or a playlist track.")
+
+    def on_double_click(self, event):
+        # On double-click, always play from the main list selection
         idx = self.listbox.curselection()
         if not idx:
-            messagebox.showinfo("Select", "Please select an audio file from the list.")
             return
         index = idx[0]
         try:
@@ -759,11 +1552,12 @@ class OsuMP3Browser(tk.Tk):
             return
         self._play_path(path)
 
-    def on_double_click(self, event):
-        self.play_selected()
-
-    def _play_path(self, path: Path):
+    def _play_path(self, path: Path, from_playlist: bool = False):
         try:
+            # Cancel any ongoing playlist runner when this is a manual play
+            if not from_playlist:
+                self._playlist_cancelled = True
+                self._playlist_runner_active = False
             if not audio.load_and_play(str(path)):
                 messagebox.showerror("Playback error", f"Failed to play {path}")
                 return
@@ -810,30 +1604,46 @@ class OsuMP3Browser(tk.Tk):
             if bg and HAS_PIL and Image and ImageTk:
                 try:
                     img = Image.open(bg)
-                    # create thumbnail keeping aspect ratio, fit into 120x80
+                    # fit into fixed canvas and center to avoid layout shifts
+                    canvas_w, canvas_h = self._now_img_size if hasattr(self, '_now_img_size') else (120, 80)
                     resampling = getattr(Image, 'Resampling', None)
-                    if resampling is not None:
-                        resample = getattr(resampling, 'LANCZOS', None)
-                    else:
-                        resample = getattr(Image, 'LANCZOS', None)
+                    resample = getattr(resampling, 'LANCZOS', None) if resampling is not None else getattr(Image, 'LANCZOS', None)
                     if resample is not None:
-                        img.thumbnail((120, 80), resample)
+                        img.thumbnail((canvas_w, canvas_h), resample)
                     else:
-                        img.thumbnail((120, 80))
-                    photo = ImageTk.PhotoImage(img)
+                        img.thumbnail((canvas_w, canvas_h))
+                    # paste onto fixed-size background
+                    base = Image.new('RGB', (canvas_w, canvas_h))
+                    try:
+                        x = (canvas_w - img.width) // 2
+                        y = (canvas_h - img.height) // 2
+                        base.paste(img, (x, y))
+                    except Exception:
+                        base = img
+                    photo = ImageTk.PhotoImage(base)
                     self.now_image_label.config(image=photo)
                     setattr(self.now_image_label, '_photo_ref', photo)
                 except Exception:
-                    self.now_image_label.config(image='')
-                    if hasattr(self.now_image_label, '_photo_ref'):
-                        delattr(self.now_image_label, '_photo_ref')
+                    # fallback to placeholder
+                    placeholder = getattr(self, '_now_placeholder', None)
+                    if placeholder is not None:
+                        self.now_image_label.config(image=placeholder)
+                        setattr(self.now_image_label, '_photo_ref', placeholder)
             else:
-                self.now_image_label.config(image='')
-                if hasattr(self.now_image_label, '_photo_ref'):
-                    delattr(self.now_image_label, '_photo_ref')
+                # no image available; show fixed-size placeholder
+                placeholder = getattr(self, '_now_placeholder', None)
+                if placeholder is not None:
+                    self.now_image_label.config(image=placeholder)
+                    setattr(self.now_image_label, '_photo_ref', placeholder)
             self.paused = False
         except Exception as e:
             messagebox.showerror("Playback error", f"Failed to play {path}: {e}")
+        finally:
+            # Reflect current playing track selection in playlist tracks list if present
+            try:
+                self._select_playlist_track_by_path(path)
+            except Exception:
+                pass
 
     def toggle_pause(self):
         if not audio.is_audio_initialized():
@@ -886,16 +1696,30 @@ class OsuMP3Browser(tk.Tk):
     def skip_track(self):
         """Skip to the next track based on current play mode."""
         try:
-            # Cancel current progress updates
+            # If a playlist runner is active, request skip within playlist
+            if getattr(self, '_playlist_runner_active', False):
+                self._playlist_skip_requested = True
+                try:
+                    audio.stop()
+                except Exception:
+                    pass
+                # progress updater will be restarted by next track via _play_path
+                if self._progress_after_id:
+                    try:
+                        self.after_cancel(self._progress_after_id)
+                    except Exception:
+                        pass
+                    self._progress_after_id = None
+                return
+
+            # Otherwise, behave as before: cancel updater and go to next in visible list
             if self._progress_after_id:
                 try:
                     self.after_cancel(self._progress_after_id)
                 except Exception:
                     pass
                 self._progress_after_id = None
-            
-            # Use the existing track end logic to determine next track
-            self._on_track_end()
+            self._on_track_end(force_next=True)
         except Exception:
             pass
 
@@ -904,6 +1728,7 @@ class OsuMP3Browser(tk.Tk):
         self.current_label.config(text="Not playing")
         # clear now-playing and cancel progress updates
         self._playing_path = None
+        self._playlist_runner_active = False
         # clear manual timing
         self._start_time = None
         self._pause_time = None
@@ -921,9 +1746,11 @@ class OsuMP3Browser(tk.Tk):
                 pass
             self._progress_after_id = None
         self.now_title_label.config(text="Now: Not playing")
-        self.now_image_label.config(image='')
-        if hasattr(self.now_image_label, '_photo_ref'):
-            delattr(self.now_image_label, '_photo_ref')
+        # restore placeholder to keep layout stable
+        placeholder = getattr(self, '_now_placeholder', None)
+        if placeholder is not None:
+            self.now_image_label.config(image=placeholder)
+            setattr(self.now_image_label, '_photo_ref', placeholder)
         self.progress['value'] = 0
         self.time_label.config(text="0:00 / 0:00")
 
@@ -968,11 +1795,13 @@ class OsuMP3Browser(tk.Tk):
         except Exception:
             pass
 
-    def _on_track_end(self):
-        """Called when the current track finishes playing. Decide whether to loop or play next."""
+    def _on_track_end(self, force_next: bool = False):
+        """Called when the current track finishes playing. Decide whether to loop or play next.
+        If force_next is True (e.g., Skip pressed), bypass loop mode and advance.
+        """
         try:
             # if loop enabled, restart same track
-            if self.play_mode == 'loop' and self._playing_path:
+            if self.play_mode == 'loop' and self._playing_path and not force_next:
                 try:
                     audio.restart_playback(str(self._playing_path))
                 except Exception:
@@ -1112,40 +1941,53 @@ class OsuMP3Browser(tk.Tk):
                 pass
         album = meta.get('album') or ''
         duration = format_duration(meta.get('duration')) if meta.get('duration') else ''
-        self.meta_title.config(text=f"Title: {title}")
-        self.meta_artist.config(text=f"Artist: {artist}")
-        self.meta_album.config(text=f"Album: {album}")
-        self.meta_duration.config(text=f"Duration: {duration}")
-        self.meta_path.config(text=f"Path: {path}")
+        per_line = getattr(self, '_meta_label_width', 52)
+        self.meta_title.config(text=self._format_meta_two_lines('Title: ', title, per_line))
+        self.meta_artist.config(text=self._format_meta_two_lines('Artist: ', artist, per_line))
+        self.meta_album.config(text=self._format_meta_two_lines('Album: ', album, per_line))
+        # Duration: keep two-line shape for stability
+        self.meta_duration.config(text=self._format_meta_two_lines('Duration: ', duration, per_line))
+        self.meta_path.config(text=self._format_meta_two_lines('Path: ', str(path), per_line, middle=True))
+        # Store the full path for tooltip
+        try:
+            self._meta_path_full = str(path)
+        except Exception:
+            self._meta_path_full = ''
         # Try to load background from the first .osu file in the folder
         bg = get_osu_background(path.parent)
         if bg and HAS_PIL and Image and ImageTk:
             try:
                 img = Image.open(bg)
-                # create thumbnail keeping aspect ratio, fit into 220x140
+                # fit into fixed canvas and center (220x140) to prevent layout shifts
+                canvas_w, canvas_h = self._meta_img_size if hasattr(self, '_meta_img_size') else (220, 140)
                 resampling = getattr(Image, 'Resampling', None)
-                if resampling is not None:
-                    resample = getattr(resampling, 'LANCZOS', None)
-                else:
-                    resample = getattr(Image, 'LANCZOS', None)
+                resample = getattr(resampling, 'LANCZOS', None) if resampling is not None else getattr(Image, 'LANCZOS', None)
                 if resample is not None:
-                    img.thumbnail((220, 140), resample)
+                    img.thumbnail((canvas_w, canvas_h), resample)
                 else:
-                    img.thumbnail((220, 140))
-                photo = ImageTk.PhotoImage(img)
+                    img.thumbnail((canvas_w, canvas_h))
+                base = Image.new('RGB', (canvas_w, canvas_h))
+                try:
+                    x = (canvas_w - img.width) // 2
+                    y = (canvas_h - img.height) // 2
+                    base.paste(img, (x, y))
+                except Exception:
+                    base = img
+                photo = ImageTk.PhotoImage(base)
                 self.meta_image_label.config(image=photo)
-                # retain reference on the label widget to avoid GC
                 setattr(self.meta_image_label, '_photo_ref', photo)
             except Exception:
-                # clear image on error
-                self.meta_image_label.config(image='')
-                if hasattr(self.meta_image_label, '_photo_ref'):
-                    delattr(self.meta_image_label, '_photo_ref')
+                # fallback to placeholder
+                placeholder = getattr(self, '_meta_placeholder', None)
+                if placeholder is not None:
+                    self.meta_image_label.config(image=placeholder)
+                    setattr(self.meta_image_label, '_photo_ref', placeholder)
         else:
-            # clear image if none found or PIL missing
-            self.meta_image_label.config(image='')
-            if hasattr(self.meta_image_label, '_photo_ref'):
-                delattr(self.meta_image_label, '_photo_ref')
+            # show placeholder if none found or PIL missing
+            placeholder = getattr(self, '_meta_placeholder', None)
+            if placeholder is not None:
+                self.meta_image_label.config(image=placeholder)
+                setattr(self.meta_image_label, '_photo_ref', placeholder)
 
     def _update_meta_display(self, path: Path):
         """Update the right-side metadata panel (title/artist/album/duration/path/image) for `path`."""
@@ -1168,11 +2010,17 @@ class OsuMP3Browser(tk.Tk):
             album = meta.get('album') or ''
             duration = format_duration(meta.get('duration')) if meta.get('duration') else ''
             try:
-                self.meta_title.config(text=f"Title: {title}")
-                self.meta_artist.config(text=f"Artist: {artist}")
-                self.meta_album.config(text=f"Album: {album}")
-                self.meta_duration.config(text=f"Duration: {duration}")
-                self.meta_path.config(text=f"Path: {path}")
+                per_line = getattr(self, '_meta_label_width', 52)
+                self.meta_title.config(text=self._format_meta_two_lines('Title: ', title, per_line))
+                self.meta_artist.config(text=self._format_meta_two_lines('Artist: ', artist, per_line))
+                self.meta_album.config(text=self._format_meta_two_lines('Album: ', album, per_line))
+                self.meta_duration.config(text=self._format_meta_two_lines('Duration: ', duration, per_line))
+                self.meta_path.config(text=self._format_meta_two_lines('Path: ', str(path), per_line, middle=True))
+                # Store full path for tooltip
+                try:
+                    self._meta_path_full = str(path)
+                except Exception:
+                    self._meta_path_full = ''
             except Exception:
                 pass
 
@@ -1181,29 +2029,36 @@ class OsuMP3Browser(tk.Tk):
             if bg and HAS_PIL and Image and ImageTk:
                 try:
                     img = Image.open(bg)
+                    canvas_w, canvas_h = self._meta_img_size if hasattr(self, '_meta_img_size') else (220, 140)
                     resampling = getattr(Image, 'Resampling', None)
-                    if resampling is not None:
-                        resample = getattr(resampling, 'LANCZOS', None)
-                    else:
-                        resample = getattr(Image, 'LANCZOS', None)
+                    resample = getattr(resampling, 'LANCZOS', None) if resampling is not None else getattr(Image, 'LANCZOS', None)
                     if resample is not None:
-                        img.thumbnail((220, 140), resample)
+                        img.thumbnail((canvas_w, canvas_h), resample)
                     else:
-                        img.thumbnail((220, 140))
-                    photo = ImageTk.PhotoImage(img)
+                        img.thumbnail((canvas_w, canvas_h))
+                    base = Image.new('RGB', (canvas_w, canvas_h))
+                    try:
+                        x = (canvas_w - img.width) // 2
+                        y = (canvas_h - img.height) // 2
+                        base.paste(img, (x, y))
+                    except Exception:
+                        base = img
+                    photo = ImageTk.PhotoImage(base)
                     self.meta_image_label.config(image=photo)
                     setattr(self.meta_image_label, '_photo_ref', photo)
                 except Exception:
-                    self.meta_image_label.config(image='')
-                    if hasattr(self.meta_image_label, '_photo_ref'):
-                        delattr(self.meta_image_label, '_photo_ref')
+                    placeholder = getattr(self, '_meta_placeholder', None)
+                    if placeholder is not None:
+                        self.meta_image_label.config(image=placeholder)
+                        setattr(self.meta_image_label, '_photo_ref', placeholder)
             else:
                 try:
-                    self.meta_image_label.config(image='')
+                    placeholder = getattr(self, '_meta_placeholder', None)
+                    if placeholder is not None:
+                        self.meta_image_label.config(image=placeholder)
+                        setattr(self.meta_image_label, '_photo_ref', placeholder)
                 except Exception:
                     pass
-                if hasattr(self.meta_image_label, '_photo_ref'):
-                    delattr(self.meta_image_label, '_photo_ref')
         except Exception:
             pass
 
@@ -1274,6 +2129,27 @@ class OsuMP3Browser(tk.Tk):
         except Exception:
             pass
 
+    def _on_meta_path_enter(self, event=None):
+        """Show full path in a tooltip when hovering the Path label."""
+        try:
+            full = getattr(self, '_meta_path_full', '')
+            if not full:
+                return
+            widget = self.meta_path if hasattr(self, 'meta_path') and self.meta_path is not None else (event.widget if event is not None else None)
+            if widget is None:
+                return
+            x = widget.winfo_rootx() + 10
+            y = widget.winfo_rooty() + widget.winfo_height() + 6
+            self._show_title_tooltip(x, y, str(full), idx='meta_path')
+        except Exception:
+            pass
+
+    def _on_meta_path_leave(self, event=None):
+        try:
+            self._hide_title_tooltip()
+        except Exception:
+            pass
+
     def _show_title_tooltip(self, x, y, text, idx):
         """Create and show the tooltip immediately at x,y with given text."""
         try:
@@ -1326,6 +2202,15 @@ class OsuMP3Browser(tk.Tk):
             # Prefer manual timing base for progress display
             busy = audio.is_busy()
             if not busy and not self.paused:
+                # If a playlist runner is active, let it handle advancing
+                if getattr(self, '_playlist_runner_active', False):
+                    try:
+                        if self._progress_after_id:
+                            self.after_cancel(self._progress_after_id)
+                        self._progress_after_id = None
+                    except Exception:
+                        pass
+                    return
                 # playback finished; handle end-of-track behavior (loop or advance)
                 try:
                     if self._progress_after_id:
