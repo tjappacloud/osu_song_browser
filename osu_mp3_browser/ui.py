@@ -85,24 +85,26 @@ class OsuMP3Browser(tk.Tk):
         self.dir_label = ttk.Label(top, text=f"Songs dir: {self.songs_dir}")
         self.dir_label.pack(side=tk.LEFT, expand=True)
 
-        browse_btn = ttk.Button(top, text="Browse...", command=self.browse_folder)
-        browse_btn.pack(side=tk.RIGHT)
-        # Manual scan button for debugging/refresh
-        scan_btn = ttk.Button(top, text="Scan Now", command=lambda: threading.Thread(target=self.scan_and_populate, daemon=True).start())
-        scan_btn.pack(side=tk.RIGHT, padx=(6, 0))
-        # Clear thumbnail cache action
-        clear_thumbs_btn = ttk.Button(top, text="Clear Thumbs", command=self._clear_thumbnail_cache)
-        clear_thumbs_btn.pack(side=tk.RIGHT, padx=(6, 0))
-        # Dark mode toggle
+        # Top-row Actions dropdown via Menubutton (includes dark mode toggle)
         try:
-            self.dark_check = ttk.Checkbutton(top, text="Dark Mode", variable=self.dark_mode_var, command=self._on_theme_changed)
-            self.dark_check.pack(side=tk.RIGHT, padx=(6, 0))
-        except Exception:
+            actions_mb = tk.Menubutton(top, text="Actions", relief=tk.RAISED)
+            actions_menu = tk.Menu(actions_mb, tearoff=0)
+            actions_menu.add_command(label="Browse...", command=self.browse_folder)
+            actions_menu.add_command(label="Scan Now", command=lambda: threading.Thread(target=self.scan_and_populate, daemon=True).start())
+            actions_menu.add_separator()
+            actions_menu.add_command(label="Clear Thumbs", command=self._clear_thumbnail_cache)
+            actions_menu.add_command(label="Stats", command=self._open_stats_page)
+            actions_menu.add_separator()
+            # Dark mode toggle within the dropdown
             try:
-                self.dark_check = tk.Checkbutton(top, text="Dark Mode", variable=self.dark_mode_var, command=self._on_theme_changed)
-                self.dark_check.pack(side=tk.RIGHT, padx=(6, 0))
+                actions_menu.add_checkbutton(label="Dark Mode", variable=self.dark_mode_var, command=self._on_theme_changed)
             except Exception:
-                pass
+                actions_menu.add_command(label="Toggle Dark Mode", command=self._on_theme_changed)
+            actions_mb.config(menu=actions_menu)
+            actions_mb.pack(side=tk.RIGHT, padx=(6, 0))
+        except Exception:
+            pass
+        # Dark mode toggle moved to Actions dropdown; omit main UI checkbox
         
         # Search entry
         search_frame = ttk.Frame(self)
@@ -119,6 +121,19 @@ class OsuMP3Browser(tk.Tk):
         self._debug_thumbnails = False
         self._debug_thumb_print_limit = 10
         self._debug_thumb_print_count = 0
+
+        # Record base font sizes to avoid cumulative growth when toggling theme
+        self._base_font_sizes = {}
+        try:
+            if tkfont is not None:
+                for name in ['TkDefaultFont', 'TkTextFont', 'TkHeadingFont', 'TkTooltipFont']:
+                    try:
+                        f = tkfont.nametofont(name)
+                        self._base_font_sizes[name] = int(f.cget('size'))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         mid = ttk.Frame(self)
         mid.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
@@ -363,6 +378,19 @@ class OsuMP3Browser(tk.Tk):
         except Exception:
             self.playlists = PlaylistStore(storage_path=Path(".osu_song_browser_playlists.json"))
 
+        # --- Stats tracking ---
+        # stats: path -> { 'play_count': int, 'seconds_listened': float, 'last_played': float }
+        self._stats = {}
+        try:
+            base_dir = Path.home()
+        except Exception:
+            base_dir = Path('.')
+        self._stats_path = base_dir / ".osu_song_browser_stats.json"
+        try:
+            self._load_stats()
+        except Exception:
+            pass
+
         # try to load existing cache so UI can populate faster (also loads theme)
         try:
             self._load_cache()
@@ -396,6 +424,8 @@ class OsuMP3Browser(tk.Tk):
             self._build_song_context_menu()
         except Exception:
             pass
+
+        # Stats accessible via Actions menu; button removed
 
     def _init_playlists_ui(self):
         """Create a compact playlists section inside the right panel."""
@@ -1347,18 +1377,14 @@ class OsuMP3Browser(tk.Tk):
             except Exception:
                 pass
 
-            # Increase default font size globally (+2pt) to make text more visible
+            # Apply font sizes based on recorded base to prevent cumulative growth
             try:
-                if tkfont is not None:
-                    df = tkfont.nametofont('TkDefaultFont')
-                    cur_size = int(df.cget('size'))
-                    df.configure(size=cur_size + 2)
-                    # also update specialized fonts if present
-                    for name in ['TkTextFont', 'TkHeadingFont', 'TkTooltipFont']:
+                if tkfont is not None and hasattr(self, '_base_font_sizes'):
+                    increment = 2
+                    for name, base_sz in self._base_font_sizes.items():
                         try:
                             f = tkfont.nametofont(name)
-                            sz = int(f.cget('size'))
-                            f.configure(size=sz + 2)
+                            f.configure(size=int(base_sz) + increment)
                         except Exception:
                             pass
             except Exception:
@@ -1598,6 +1624,24 @@ class OsuMP3Browser(tk.Tk):
                     json.dump(payload, f)
             except Exception:
                 pass
+        except Exception:
+            pass
+
+    # --- Stats persistence ---
+    def _load_stats(self):
+        try:
+            if self._stats_path.exists():
+                with self._stats_path.open('r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    self._stats = data
+        except Exception:
+            pass
+
+    def _save_stats(self):
+        try:
+            with self._stats_path.open('w', encoding='utf-8') as f:
+                json.dump(self._stats, f)
         except Exception:
             pass
 
@@ -1962,6 +2006,11 @@ class OsuMP3Browser(tk.Tk):
             if not from_playlist:
                 self._playlist_cancelled = True
                 self._playlist_runner_active = False
+            # If a previous track is playing, accumulate its listening time before switching
+            try:
+                self._accumulate_current_listen_time(finalize=True)
+            except Exception:
+                pass
             if not audio.load_and_play(str(path)):
                 messagebox.showerror("Playback error", f"Failed to play {path}")
                 return
@@ -1990,6 +2039,16 @@ class OsuMP3Browser(tk.Tk):
                 self._start_time = None
             self._pause_time = None
             self._paused_offset = 0.0
+            # Increment play count and set last played
+            try:
+                key = str(path)
+                st = self._stats.get(key, {"play_count": 0, "seconds_listened": 0.0, "last_played": 0.0})
+                st["play_count"] = int(st.get("play_count", 0)) + 1
+                st["last_played"] = float(time.time())
+                self._stats[key] = st
+                self._save_stats()
+            except Exception:
+                pass
             # cancel previous updater if any
             if self._progress_after_id:
                 try:
@@ -2134,6 +2193,11 @@ class OsuMP3Browser(tk.Tk):
         audio.stop()
         self.current_label.config(text="Not playing")
         # clear now-playing and cancel progress updates
+        try:
+            # accumulate listening time for the track being stopped
+            self._accumulate_current_listen_time(finalize=True)
+        except Exception:
+            pass
         self._playing_path = None
         self._playlist_runner_active = False
         # clear manual timing
@@ -2671,6 +2735,8 @@ class OsuMP3Browser(tk.Tk):
                 except Exception:
                     pass
                 try:
+                    # accumulate listening time and then advance
+                    self._accumulate_current_listen_time(finalize=True)
                     self.after(100, self._on_track_end)
                 except Exception:
                     self.stop()
@@ -2709,6 +2775,151 @@ class OsuMP3Browser(tk.Tk):
             self._progress_after_id = self.after(500, self.update_progress)
         except Exception:
             self._progress_after_id = None
+
+    # --- Listening time accumulation ---
+    def _accumulate_current_listen_time(self, finalize: bool = False):
+        try:
+            path = getattr(self, '_playing_path', None)
+            if not path:
+                return
+            # compute elapsed using manual timing base
+            elapsed = 0.0
+            if self._start_time is not None:
+                if self.paused and self._pause_time:
+                    elapsed = (self._pause_time - self._start_time) + self._paused_offset
+                else:
+                    elapsed = (time.time() - self._start_time) + self._paused_offset
+            key = str(path)
+            st = self._stats.get(key, {"play_count": 0, "seconds_listened": 0.0, "last_played": 0.0})
+            st["seconds_listened"] = float(st.get("seconds_listened", 0.0)) + float(max(0.0, elapsed))
+            self._stats[key] = st
+            self._save_stats()
+            # Reset manual timing if finalizing this track
+            if finalize:
+                self._start_time = None
+                self._pause_time = None
+                self._paused_offset = 0.0
+        except Exception:
+            pass
+
+    # --- Stats page ---
+    def _open_stats_page(self):
+        try:
+            tw = tk.Toplevel(self)
+            tw.title("Stats")
+            frm = ttk.Frame(tw)
+            frm.pack(fill=tk.BOTH, expand=True)
+            
+            # Filter box
+            filter_row = ttk.Frame(frm)
+            filter_row.pack(fill=tk.X, padx=6, pady=(6, 2))
+            ttk.Label(filter_row, text="Filter:").pack(side=tk.LEFT)
+            stats_filter_var = tk.StringVar()
+            stats_filter_entry = ttk.Entry(filter_row, textvariable=stats_filter_var, width=28)
+            stats_filter_entry.pack(side=tk.LEFT, padx=(6, 0))
+            
+            # Add Title column and enable sorting on any column
+            columns = ("title", "plays", "time", "last")
+            tv = ttk.Treeview(frm, columns=columns, show='headings')
+            tv.heading("title", text="Title")
+            tv.heading("plays", text="Plays")
+            tv.heading("time", text="Time Listened")
+            tv.heading("last", text="Last Played")
+            tv.column("title", width=280, anchor='w')
+            tv.column("plays", width=80, anchor='center')
+            tv.column("time", width=160, anchor='w')
+            tv.column("last", width=180, anchor='w')
+            tv.pack(fill=tk.BOTH, expand=True)
+            # map path to display title
+            def disp_title(p: str):
+                try:
+                    path = Path(p)
+                    folder = path.parent.name if path.parent else path.name
+                    return strip_leading_numbers(folder)
+                except Exception:
+                    return p
+            
+            def populate(filter_text: str = ""):
+                try:
+                    # clear existing
+                    for iid in tv.get_children(''):
+                        tv.delete(iid)
+                except Exception:
+                    pass
+                f = (filter_text or '').strip().lower()
+                for p, st in self._stats.items():
+                    title_val = disp_title(p)
+                    if f and f not in str(title_val).lower():
+                        continue
+                    plays = int(st.get("play_count", 0))
+                    secs = float(st.get("seconds_listened", 0.0))
+                    last_ts = float(st.get("last_played", 0.0))
+                    time_str = format_duration(int(secs))
+                    try:
+                        last_str = time.strftime('%Y-%m-%d %H:%M', time.localtime(last_ts)) if last_ts else ''
+                    except Exception:
+                        last_str = ''
+                    tv.insert('', 'end', values=(title_val, plays, time_str, last_str))
+            
+            populate("")
+            
+            # Bind filter changes
+            try:
+                def on_filter_change(*args):
+                    populate(stats_filter_var.get())
+                stats_filter_var.trace_add('write', lambda *args: on_filter_change())
+            except Exception:
+                pass
+            
+            # Sorting support: click column headers to sort
+            def sort_by(col, reverse=False):
+                try:
+                    # extract data for sorting
+                    items = [(tv.set(k, col), k) for k in tv.get_children('')]
+                    # normalize values for numeric/time sorting
+                    def as_key(v):
+                        if col == 'plays':
+                            try:
+                                return int(v)
+                            except Exception:
+                                return 0
+                        if col == 'time':
+                            # v like 'm:ss' or 'h:mm:ss'; convert to seconds
+                            try:
+                                parts = [int(x) for x in str(v).split(':')]
+                                if len(parts) == 3:
+                                    return parts[0]*3600 + parts[1]*60 + parts[2]
+                                if len(parts) == 2:
+                                    return parts[0]*60 + parts[1]
+                                return int(parts[0])
+                            except Exception:
+                                return 0
+                        if col == 'last':
+                            # parse back to timestamp if possible
+                            try:
+                                return time.mktime(time.strptime(v, '%Y-%m-%d %H:%M'))
+                            except Exception:
+                                return 0
+                        # title or unknown: string compare lowercased
+                        return str(v).lower()
+                    items.sort(key=lambda t: as_key(t[0]), reverse=reverse)
+                    # reinsert in sorted order
+                    for index, (val, k) in enumerate(items):
+                        tv.move(k, '', index)
+                    # toggle sort order on next click
+                    tv.heading(col, command=lambda: sort_by(col, not reverse))
+                except Exception:
+                    pass
+
+            for c in columns:
+                try:
+                    tv.heading(c, command=lambda col=c: sort_by(col, False))
+                except Exception:
+                    pass
+            # add a title column via tags by creating another tree with text if desired; for simplicity, prepend title as first column
+            # Enhance by adding a filter or sort buttons later
+        except Exception:
+            pass
 
     def refresh_list(self):
         # Refresh visible entries based on `self.search_var`.
