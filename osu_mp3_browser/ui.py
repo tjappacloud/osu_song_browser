@@ -48,7 +48,7 @@ class OsuMP3Browser(tk.Tk):
             messagebox.showwarning("Audio init failed", "pygame.mixer.init() failed")
         
         # default volume (0.0 - 1.0)
-        self.volume_var = tk.DoubleVar(value=0.8)
+        self.volume_var = tk.DoubleVar(value=0.5)
         if audio.is_audio_initialized():
             audio.set_volume(self.volume_var.get())
 
@@ -79,8 +79,13 @@ class OsuMP3Browser(tk.Tk):
         self._seen_paths = set()
 
         # UI
+        # Use grid at the root level so the middle list area can grow/shrink while
+        # keeping the top/bottom bars visible during window resizes.
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)  # main content row grows
+
         top = ttk.Frame(self)
-        top.pack(fill=tk.X, padx=8, pady=6)
+        top.grid(row=0, column=0, sticky='ew', padx=8, pady=6)
 
         self.dir_label = ttk.Label(top, text=f"Songs dir: {self.songs_dir}")
         self.dir_label.pack(side=tk.LEFT, expand=True)
@@ -108,7 +113,7 @@ class OsuMP3Browser(tk.Tk):
         
         # Search entry
         search_frame = ttk.Frame(self)
-        search_frame.pack(fill=tk.X, padx=8)
+        search_frame.grid(row=1, column=0, sticky='ew', padx=8)
         ttk.Label(search_frame, text="Search:").pack(side=tk.LEFT, padx=(0, 6))
         self.search_var = tk.StringVar()
         self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
@@ -136,7 +141,7 @@ class OsuMP3Browser(tk.Tk):
             pass
 
         mid = ttk.Frame(self)
-        mid.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+        mid.grid(row=2, column=0, sticky='nsew', padx=8, pady=6)
 
         left = ttk.Frame(mid)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -236,11 +241,11 @@ class OsuMP3Browser(tk.Tk):
             pass
 
         bottom = ttk.Frame(self)
-        bottom.pack(fill=tk.X, padx=8, pady=6)
+        bottom.grid(row=4, column=0, sticky='ew', padx=8, pady=6)
 
         # Now playing area (shows thumbnail and song title) - placed just above controls
         now_frame = ttk.Frame(self)
-        now_frame.pack(fill=tk.X, padx=8, pady=(0, 4))
+        now_frame.grid(row=3, column=0, sticky='ew', padx=8, pady=(0, 4))
         self.now_image_label = ttk.Label(now_frame)
         self.now_image_label.pack(side=tk.LEFT, padx=(0, 8))
         now_right = ttk.Frame(now_frame)
